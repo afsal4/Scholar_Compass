@@ -16,7 +16,7 @@ import requests
 import io
 import re 
 import numpy as np 
-from sklearn.feature_extraction.text import TfidfVectorizer
+# from sklearn.feature_extraction.text import TfidfVectorizer
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -36,11 +36,11 @@ if 'GOOGLE_API_KEY' not in os.environ:
 if 'PINECONE_API_KEY' not in os.environ:
     os.environ['PINECONE_API_KEY'] = pinecone_api_key
 
-# vectorizer loading tfidf 
-corpus = np.load('data/preprocessed_documents.npz')
-corpus = corpus['corpus']
-vectorize = TfidfVectorizer(max_df=0.97, min_df=0.005, ngram_range = (1, 2))
-vectorize.fit(corpus)
+# # vectorizer loading tfidf 
+# corpus = np.load('data/preprocessed_documents.npz')
+# corpus = corpus['corpus']
+# vectorize = TfidfVectorizer(max_df=0.97, min_df=0.005, ngram_range = (1, 2))
+# vectorize.fit(corpus)
 
 headers = {
   'x-api-key': os.environ['CHATPDF_API_KEY'],
@@ -112,27 +112,27 @@ def get_vectorstore(text_chunks):
     vectorstore.save_local('tmp_pdf_vectorstore')
     return vectorstore
 
-def get_tf_idf_res(query):
-    print('TFIDF Searching....')
+# def get_tf_idf_res(query):
+#     print('TFIDF Searching....')
 
-    index_name = 'recommendation-tfidf-bigram'
-    pc = Pinecone(api_key=pinecone_api_key)
-    index = pc.Index(index_name)
+#     index_name = 'recommendation-tfidf-bigram'
+#     pc = Pinecone(api_key=pinecone_api_key)
+#     index = pc.Index(index_name)
 
-    query_vec = vectorize.transform([query]).toarray()
-    query_vec = query_vec.squeeze()
-    val = [float(i) for i in query_vec]
+#     query_vec = vectorize.transform([query]).toarray()
+#     query_vec = query_vec.squeeze()
+#     val = [float(i) for i in query_vec]
 
-    recommendations = index.query(vector=val, top_k=4, include_metadata=True)
+#     recommendations = index.query(vector=val, top_k=4, include_metadata=True)
 
-    pdf_links = []
-    titles = []
-    for results in recommendations['matches']:
-        id = results['metadata']['id']
-        title = results['metadata']['title']
-        pdf_links.append(LINK+str(id))
-        titles.append(title)
-    return pdf_links, titles
+#     pdf_links = []
+#     titles = []
+#     for results in recommendations['matches']:
+#         id = results['metadata']['id']
+#         title = results['metadata']['title']
+#         pdf_links.append(LINK+str(id))
+#         titles.append(title)
+#     return pdf_links, titles
 
 
 def get_hybrid_res(query):
@@ -196,8 +196,8 @@ def get_links(query, method='Context Search'):
             pdf_ordered_links, ordered_titles = create_link(corrected_ids, SIMILARITY_THRESHOLD)
         case 'Hybrid Search':
             pdf_ordered_links, ordered_titles = get_hybrid_res(query)
-        case 'TFIDF Search':
-            pdf_ordered_links, ordered_titles = get_tf_idf_res(query)
+        # case 'TFIDF Search':
+        #     pdf_ordered_links, ordered_titles = get_tf_idf_res(query)
 
     return pdf_ordered_links, ordered_titles
 
