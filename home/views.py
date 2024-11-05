@@ -15,6 +15,7 @@ import os
 import requests
 import io
 import re 
+import joblib
 import numpy as np 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from dotenv import load_dotenv
@@ -37,10 +38,7 @@ if 'PINECONE_API_KEY' not in os.environ:
     os.environ['PINECONE_API_KEY'] = pinecone_api_key
 
 # vectorizer loading tfidf 
-corpus = np.load('data/preprocessed_documents.npz')
-corpus = corpus['corpus']
-vectorize = TfidfVectorizer(max_df=0.97, min_df=0.005, ngram_range = (1, 2))
-vectorize.fit(corpus)
+vectorize = joblib.load('data/tf_idf_vectorizer.pkl')
 
 print('finished vector loading')
 headers = {
