@@ -8,11 +8,13 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 from langchain_pinecone import PineconeVectorStore
+from django.views.decorators.cache import never_cache
 from pinecone_text.sparse import BM25Encoder
 from pinecone import Pinecone
 from .prompts import template_t1, manual_prompt, react_prompt
 import os
 import requests
+import datetime
 import io
 import re 
 import joblib
@@ -22,6 +24,11 @@ from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+import markdown
+from django import template
+from django.utils.safestring import mark_safe
+from cs50 import SQL
+import uuid 
 load_dotenv()
 
 INDEX_NAME = 'recomentation'
@@ -31,33 +38,60 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 40
 
 pinecone_api_key = os.getenv('PINECONE_API_KEY')
+os.environ['GOOGLE_API_KEY'] = os.getenv('GOOGLE_API_KEY')
+os.environ['PINECONE_API_KEY'] = pinecone_api_key
 
-if 'GOOGLE_API_KEY' not in os.environ:
-    os.environ['GOOGLE_API_KEY'] = os.getenv('GOOGLE_API_KEY')
-if 'PINECONE_API_KEY' not in os.environ:
-    os.environ['PINECONE_API_KEY'] = pinecone_api_key
+HEADERS = {
+  'x-api-key': os.environ['CHATPDF_API_KEY'],
+  'Content-Type': 'application/json'
+}
 
 # vectorizer loading tfidf 
 vectorize = joblib.load('data/tf_idf_vectorizer.pkl')
 
-print('finished vector loading')
-headers = {
-  'x-api-key': os.environ['CHATPDF_API_KEY'],
-  'Content-Type': 'application/json'
-}
-chatpdf_messages = []
-
-chat_messages = []
+# models
 chat_model = ChatGoogleGenerativeAI(model='gemini-pro', convert_system_message_to_human=True, stop=['A:'])
+pdf_rag_model = ChatGoogleGenerativeAI(model='gemini-pro', convert_system_message_to_human=True)
 
-pdf_chat_messages = []
-pdf_chat_model = ChatGoogleGenerativeAI(model='gemini-pro', convert_system_message_to_human=True)
+# message history
+chatpdf_messages = []
+pdf_rag_messages = []
+
+# database 
+db = SQL("sqlite:///home/static/database.db") 
 
 
-# custom_filters.py
-import markdown
-from django import template
-from django.utils.safestring import mark_safe
+db.execute("""
+CREATE TABLE IF NOT EXISTS chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    role TEXT,
+    message TEXT,
+    timestamp TEXT
+);
+""")
+
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS chatpdf_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    role TEXT,
+    message TEXT,
+    timestamp TEXT
+);
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS rag_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    role TEXT,
+    message TEXT,
+    timestamp TEXT
+);
+""")
+
 
 register = template.Library()
 
@@ -74,19 +108,35 @@ def clean_text(text):
     return cleaned_string
 
 
-def get_chat_message(text):
-    print(text)
+# Function to store messages in the database
+def store_message(session_id, role, message, format):
+    timestamp = datetime.datetime.now().isoformat()
+    db.execute(f"INSERT INTO {format} (session_id, role, message, timestamp) VALUES (?, ?, ?, ?)",
+               session_id, role, message, timestamp)
+
+# Function to retrieve chat history for a given session
+def get_chat_history(session_id):
+    rows = db.execute("SELECT role, message FROM chat_history WHERE session_id = ? ORDER BY timestamp", session_id)
+    return [HumanMessage(row['message']) if row['role'] == 'user' else AIMessage(row['message']) for row in rows]
+
+# Define get_session for use with RunnableWithMessageHistory
+def get_session(session_id):
+    chat_history = get_chat_history(session_id)
+    return ChatMessageHistory(messages=chat_history)
+
+# Main function to handle a user message and generate AI response
+def get_chat_message(text, session_id):
     parser = StrOutputParser()
     chain = template_t1 | chat_model | parser
     with_message_history = RunnableWithMessageHistory(chain, get_session)
-    config = {'configurable': {'session_id': 'sgd'}}
-    chat_messages.append(HumanMessage(text))
-    ai_message = with_message_history.invoke(chat_messages, config=config)
-    ai_message = clean_text(ai_message)
-    chat_messages.append(AIMessage(ai_message))
+    store_message(session_id, 'user', text, 'chat_history')
+    configurable = {'configurable': {'session_id': session_id}}
+    chat_message_history = get_chat_history(session_id)
+    ai_response = with_message_history.invoke(chat_message_history, config=configurable)
+    ai_response = clean_text(ai_response)
+    store_message(session_id, 'assistant', ai_response, 'chat_history')
+    return ai_response
 
-def get_session(session_id):
-    return ChatMessageHistory()
 
 def get_correct_ids(similar_docs):
     ''''Return dictionary of id and score after correction of id'''
@@ -200,21 +250,32 @@ def get_links(query, method='Context Search'):
 
     return pdf_ordered_links, ordered_titles
 
+@never_cache
 def home(request):
     messages = []
     tmp = {}
     papers = {}
     method = 'Context Search'
+    uid = None
+    # Creating unique id for new session
+    if 'session_uid' not in request.session:
+        uid = uuid.uuid4().hex
+        while db.execute('SELECT * FROM chat_history WHERE session_id = ?', uid):
+            uid = uuid.uuid4().hex
+        request.session['session_uid'] = uid
+    uid = request.session['session_uid']
+    
 
     if request.method == 'POST':
         text = request.POST['text']
         method = request.POST['search_type']
         request.session['chat_method'] = request.POST['state']
-        print('\n\nn\n post ', text, method, chat_messages)
         if text:
-            get_chat_message(text)
-
-    for message in chat_messages:
+            print(text, type(uid), uid)
+            get_chat_message(text, uid)
+    chat_messages = get_chat_history(uid)
+    print(chat_messages, 'Uid', uid)
+    for message in get_chat_history(uid):
                 
         if type(message) == HumanMessage:
             tmp['human'] = message.content
@@ -232,12 +293,14 @@ def home(request):
     context = {'messages': messages, 'papers': papers, 'search': method}
     return render(request, 'home.html', context)
 
+@never_cache
 def chat_post(request):
-    global pdf_chat_messages, chatpdf_messages
     # resetting chat history
-    pdf_chat_messages = []
-    chatpdf_messages = []
-
+    session_id = request.session['session_uid']
+    print(f'Session {session_id}')
+    db.execute('DELETE FROM chat_history WHERE session_id = ?', session_id)
+    db.execute('DELETE FROM chatpdf_history WHERE session_id = ?', session_id)
+    db.execute('DELETE FROM rag_history WHERE session_id = ?', session_id)
     link = request.POST['link']
     name = request.POST['name']
     path = get_pdf(link)
@@ -247,7 +310,7 @@ def chat_post(request):
     request.session['link'] = link
     
     if 'srcid' in request.session:
-        delete_chatpdf(headers, request.session['srcid'])
+        delete_chatpdf(HEADERS, request.session['srcid'])
         del request.session['srcid']
     request.session['state'] = request.POST['state']
 
@@ -281,15 +344,19 @@ def pdf_rag(request):
 
     if request.session['visited'] == True:
         embeddings = GoogleGenerativeAIEmbeddings(model='models/embedding-001')
-        db = FAISS.load_local('tmp_pdf_vectorstore', embeddings, allow_dangerous_deserialization=True)
+        vec_db = FAISS.load_local('tmp_pdf_vectorstore', embeddings, allow_dangerous_deserialization=True)
     else:
         pdf_chunks = get_pdf_doc_as_chunks(path)
-        db = get_vectorstore(pdf_chunks)
+        vec_db = get_vectorstore(pdf_chunks)
         request.session['visited'] = True
     text = request.POST['text']
-    ai_res = manual_prompt(text, pdf_chat_messages, db, pdf_chat_model)
-    pdf_chat_messages.append(HumanMessage(text))
-    pdf_chat_messages.append(AIMessage(ai_res))
+    if text:
+        session_id = request.session['session_uid']
+        pdf_chat_messages = db.execute('SELECT role, message FROM rag_history WHERE session_id = ? ORDER BY timestamp', session_id)
+        pdf_chat_messages = [HumanMessage(i['message']) if i['role'] == 'user' else AIMessage(i['message']) for i in pdf_chat_messages]
+        store_message(session_id, 'user', text, 'rag_history')
+        ai_res = manual_prompt(text, pdf_chat_messages, vec_db, pdf_rag_model)
+        store_message(session_id, 'assistant', ai_res, 'rag_history')
         
 
 def create_chatpdf(headers, link):
@@ -310,6 +377,7 @@ def get_chatpdf_response(headers, srcid, messages):
         'sourceId': srcid,
         'messages': messages
     }
+    print(messages, "Messages")
     response = requests.post(
     'https://api.chatpdf.com/v1/chats/message', headers=headers, json=data)
 
@@ -341,27 +409,32 @@ def delete_chatpdf(headers, srcid):
 def chatpdf(request):
     if request.session['visited'] == False:
         link = request.session['link'] 
-        request.session['srcid'] = create_chatpdf(headers, link)
+        request.session['srcid'] = create_chatpdf(HEADERS, link)
      
 
     text = request.POST['text']
+    print('\n\n\n', text)
     if text: 
-        chatpdf_messages.append({'role': 'user', 'content': text})
-        response = get_chatpdf_response(headers, request.session['srcid'], chatpdf_messages[-6:])
-        chatpdf_messages.append({'role': 'assistant', 'content': response})
+        session_id = request.session['session_uid']
+        store_message(session_id, 'user', text, 'chatpdf_history')
+        chatpdf_messages = db.execute('SELECT role, message AS content FROM chatpdf_history WHERE session_id = ? ORDER BY timestamp', session_id)
+        print(chatpdf_messages, 'Chat Pdf Messages')
+        response = get_chatpdf_response(HEADERS, request.session['srcid'], chatpdf_messages[-6:])
+        store_message(session_id, 'assistant', response, 'chatpdf_history')
 
-
-
+@never_cache
 def view_pdf_page(request):
-    global chat_messages
-    chat_messages = []
-
     state = request.session['state']
-
+    session_id = request.session['session_uid']
     if request.method == 'POST':
 
         func = pdf_rag if state == 'rag' else chatpdf
         func(request)
-    messages = [get_markdown(i.content) for i in pdf_chat_messages] if state == 'rag' else [get_markdown(i['content']) for i in  chatpdf_messages]
+    format = 'chatpdf_history' if state != 'rag' else 'rag_history'
+    res = db.execute(f'SELECT message FROM {format} WHERE session_id = ? ORDER BY timestamp', session_id)
+
+    messages = [i['message'] for i in res] 
+    print('messages', messages)
+    messages = messages if state == 'rag' else [get_markdown(i) for i in messages]
     context = {'link': request.session['link'], 'messages': messages}
     return render(request, 'view_pdf.html', context)  
